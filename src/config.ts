@@ -1,53 +1,61 @@
-import * as core from "@actions/core";
-import * as github from "@actions/github";
-import * as Context from '@actions/github/lib/context';
-import yaml from "js-yaml";
-import path from "path";
-import { ConfigEntry } from "./ConfigEntry";
-const CONFIG_PATH = ".github";
+import * as github from '@actions/github'
+import * as Context from '@actions/github/lib/context'
+import yaml from 'js-yaml'
+import {ConfigEntry} from './ConfigEntry'
+const CONFIG_PATH = '.github'
 
-export async function getConfig(github: github.GitHub, fileName: string, context: Context.Context): Promise<ConfigEntry[]> {
-  try {
-    const configFile = {
-      owner: context.repo.owner,
-      repo: context.repo.repo,
-      path: path.posix.join(CONFIG_PATH, fileName),
-      ref: context.payload.pull_request!.head.sha,
-    };
-    core.debug(`Getting contents of ${JSON.stringify(configFile)}`);
-    const response = await github.repos.getContents(configFile);
-    if (Array.isArray(response.data)) {
-      throw new Error(`${fileName} is not a file.`);
-    }
-    if (response.data.content === undefined) {
-      throw new Error(`${fileName} is empty.`);
-    }
-    return parseConfig(response.data.content);
-  } catch (error) {
-    core.debug(`getConfig error: ${JSON.stringify(error)}`);
-    if (error.status === 404) {
-      return [];
-    }
+type ClientType = ReturnType<typeof github.getOctokit>
 
-    throw error;
-  }
+async function fetchContent(
+  client: ClientType,
+  repoPath: string,
+  context: Context.Context
+): Promise<string> {
+  const response: any = await client.rest.repos.getContent({
+    owner: context.repo.owner,
+    repo: context.repo.repo,
+    path: CONFIG_PATH + repoPath,
+    ref: context.sha
+  })
+
+  return Buffer.from(response.data.content, response.data.encoding).toString()
+}
+
+export async function getLabel(
+  client: ClientType,
+  configurationPath: string,
+  context: Context.Context
+): Promise<ConfigEntry[]> {
+  const configurationContent: string = await fetchContent(
+    client,
+    configurationPath,
+    context
+  )
+
+  // loads (hopefully) a `{[label:string]: string | StringOrMatchConfig[]}`, but is `any`:
+  const configObject = yaml.load(configurationContent)
+
+  // transform `any` => `Map<string,StringOrMatchConfig[]>` or throw if yaml is malformed:
+  return parseConfig(configObject as string)
 }
 
 function parseConfig(content: string): ConfigEntry[] {
-  const configObject = yaml.safeLoad(Buffer.from(content, "base64").toString()) || {};
-  if (configObject === {}) {
-    return [];
-  }
+  return Object.entries(content).reduce(
+    (entries: ConfigEntry[], [label, object]: [string, any]) => {
+      const headPattern =
+        object.head ||
+        (typeof object === 'string' || Array.isArray(object)
+          ? object
+          : undefined)
+      const basePattern = object.base
+      if (headPattern || basePattern) {
+        entries.push({label, head: headPattern, base: basePattern})
+      } else {
+        throw new Error('config.yml has invalid structure.')
+      }
 
-  return Object.entries(configObject).reduce((entries: ConfigEntry[], [label, object]: [string, any]) => {
-    const headPattern = object.head || (typeof object === "string" || Array.isArray(object) ? object : undefined);
-    const basePattern = object.base;
-    if (headPattern || basePattern) {
-      entries.push({ label: label, head: headPattern, base: basePattern });
-    } else {
-      throw new Error("config.yml has invalid structure.");
-    }
-
-    return entries;
-  }, []);
+      return entries
+    },
+    []
+  )
 }
